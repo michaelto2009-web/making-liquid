@@ -1,0 +1,1402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>liquid glass · v1.0</title>
+<!--
+  Refraction engine adapted from archisvaze/liquid-glass (MIT-style demo)
+  - Snell's-law refraction profile over a convex-squircle height field
+  - displacement map + specular map generated at runtime -> SVG filter
+  - backdrop-filter: url(#liquid-glass-filter) does the lensing
+-->
+<style>
+  :root {
+    --glass-radius: 48px;
+    --tint-color: 255, 255, 255;
+    --tint-opacity: 0.06;
+    --shadow-blur: 20px;
+    --shadow-spread: -5px;
+    --shadow-color: rgba(255, 255, 255, 0.45);
+    --outer-shadow-blur: 24px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; font-family: -apple-system, "SF Pro Text", "PingFang SC", sans-serif; }
+  body { user-select: none; -webkit-user-select: none; touch-action: manipulation; background: #101418; }
+
+  /* ===== background layers (crossfade) ===== */
+  .bg-layer { position: fixed; inset: 0; z-index: 0; background-size: cover; background-position: center; opacity: 0; transition: opacity .7s ease; }
+  .bg-layer.active { opacity: 1; }
+
+  /* ===== liquidfun-style sim scene ===== */
+  .sim-layer { position: fixed; inset: 0; z-index: 0; opacity: 0; transition: opacity .7s ease; }
+  .sim-layer.active { opacity: 1; }
+  /* ===== sim launch chip ===== */
+  .sim-launch {
+    position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 30;
+    display: none; border: 0; cursor: pointer; padding: 5px 11px; border-radius: 5px;
+    background: var(--panel-chip, rgba(255,255,255,.1));
+    color: var(--panel-fg, rgba(255,255,255,.85));
+    font-size: 9px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+    backdrop-filter: blur(14px) saturate(1.3);
+    -webkit-backdrop-filter: blur(14px) saturate(1.3);
+    box-shadow: inset 0 0 0 1px var(--panel-border, rgba(255,255,255,.12));
+    transition: background .12s ease;
+  }
+  .sim-launch.show { display: block; }
+  .sim-launch:hover { background: var(--panel-chip-hi, rgba(255,255,255,.2)); }
+
+  .grain {
+    position: fixed; inset: 0; z-index: 5; pointer-events: none; opacity: .1; mix-blend-mode: overlay;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='300' height='300' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  .float { position: fixed; left: 50%; top: 50%; z-index: 10; }
+
+  /* ===== the glass ===== */
+  #gc {
+    position: relative;
+    width: var(--gsize, 280px); height: var(--gsize, 280px);
+    transform: translate(calc(-50% + var(--dx,0px)), calc(-50% + var(--dy,0px)));
+    border-radius: var(--glass-radius);
+    cursor: grab; touch-action: none;
+    isolation: isolate;
+    pointer-events: none;
+    will-change: transform;
+    transition: width .16s cubic-bezier(.22,1,.36,1), height .16s cubic-bezier(.22,1,.36,1);
+    box-shadow: 0 4px var(--outer-shadow-blur) rgba(0,0,0,.18);
+  }
+  #gc.grabbing { cursor: grabbing; }
+  #gc::after {
+    content: ''; position: absolute; inset: 0; z-index: -1; border-radius: inherit;
+    backdrop-filter: url(#liquid-glass-filter);
+    -webkit-backdrop-filter: url(#liquid-glass-filter);
+    isolation: isolate;
+  }
+  body.no-refraction #gc::after { backdrop-filter: blur(10px) saturate(1.05); -webkit-backdrop-filter: blur(10px) saturate(1.05); }
+  #gc::before {
+    content: ''; position: absolute; inset: 0; z-index: 1; border-radius: inherit;
+    box-shadow: inset 0 0 var(--shadow-blur) var(--shadow-spread) var(--shadow-color);
+    background: rgba(var(--tint-color), var(--tint-opacity));
+    pointer-events: none;
+  }
+  #drag { position: absolute; inset: 0; z-index: 2; pointer-events: auto; touch-action: none; }
+  .glass-label {
+    position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
+    text-align: center; pointer-events: none;
+    color: rgba(255,255,255,.94); font-size: 13px; font-weight: 500;
+    letter-spacing: .12em; text-shadow: 0 1px 8px rgba(0,0,0,.45);
+  }
+
+  /* ===== corner controls ===== */
+  .corner-btn {
+    position: fixed; z-index: 30;
+    border: 0; cursor: pointer;
+    background: rgba(18,20,26,.55);
+    backdrop-filter: blur(12px) saturate(1.4);
+    -webkit-backdrop-filter: blur(12px) saturate(1.4);
+    color: rgba(255,255,255,.92);
+    font-size: 10px; letter-spacing: .06em;
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,.35), inset 0 0 0 1px rgba(255,255,255,.14);
+    transition: transform .15s ease, background .15s ease;
+  }
+  .corner-btn:hover { background: rgba(30,34,44,.7); }
+  .corner-btn:active { transform: scale(.94); }
+  .bg-btn { right: 10px; bottom: 10px; padding: 8px 13px; }
+
+  /* ===== why we built this (frameless dropdown, always contrasted) ===== */
+  .why {
+    position: fixed; left: 14px; top: 14px; z-index: 25;
+    max-width: 250px;
+    font-size: 10px; line-height: 1.5;
+    color: var(--why-fg, rgba(255,255,255,.92));
+    text-shadow: var(--why-shadow, 0 1px 6px rgba(0,0,0,.5));
+    pointer-events: none;
+  }
+  .why-toggle {
+    pointer-events: auto; cursor: pointer; user-select: none;
+    font-size: 9px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase;
+    opacity: .85;
+  }
+  .why-toggle .caret { display: inline-block; margin-left: 4px; transition: transform .2s ease; }
+  .why.open .caret { transform: rotate(180deg); }
+  .why-body { overflow: hidden; max-height: 0; opacity: 0; transition: max-height .25s ease, opacity .2s ease; }
+  .why.open .why-body { max-height: 240px; opacity: 1; }
+  .why-body span { display: block; margin-top: 6px; }
+
+  .menu-btn { top: 10px; right: 10px; padding: 8px 13px; }
+
+  /* ===== tune panel: sharp, tight, adaptive ===== */
+  .panel {
+    position: fixed; top: 42px; right: 10px; z-index: 30;
+    width: 64px; max-height: 3px; overflow-x: hidden;
+    overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 8px 10px 7px; border-radius: 6px;
+    background: var(--panel-bg, rgba(8,10,14,.5));
+    backdrop-filter: blur(20px) saturate(1.35);
+    -webkit-backdrop-filter: blur(20px) saturate(1.35);
+    box-shadow: 0 10px 30px rgba(0,0,0,.35), inset 0 0 0 1px var(--panel-border, rgba(255,255,255,.12));
+    color: var(--panel-fg, rgba(255,255,255,.92)); font-size: 10px;
+    opacity: 0; visibility: hidden; transform: translateY(-5px);
+    transition: max-height .3s cubic-bezier(.22,1,.36,1), width .34s cubic-bezier(.22,1,.36,1) .24s, opacity .16s ease, transform .16s ease, visibility .16s;
+    scrollbar-width: none;
+  }
+  .panel::-webkit-scrollbar { display: none; }
+  /* while closed (or closing), sit below the code box so the handoff never overlaps */
+  .panel:not(.open) { z-index: 18; transition: max-height .28s cubic-bezier(.22,1,.36,1) .12s, width .24s cubic-bezier(.22,1,.36,1), opacity .16s ease, transform .16s ease, visibility .16s; }
+  .panel.open {
+    opacity: 1; visibility: visible; transform: translateY(0);
+    width: 200px; max-height: calc(100vh - 96px);
+  }
+  .panel-in { width: 180px; transition: width .34s cubic-bezier(.22,1,.36,1) .24s; }
+  .panel.compact .panel-in { width: 118px; }
+  @keyframes rowIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .panel.open .panel-in > * {
+    animation: rowIn .28s cubic-bezier(.22,1,.36,1) both;
+    animation-delay: calc(.4s + var(--d, 0s));
+  }
+  .panel.compact { width: 132px; }
+  .panel.compact input[type=range]::-webkit-slider-thumb { width: 12px; height: 8px; }
+  .panel.compact input[type=range]:hover::-webkit-slider-thumb, .panel.compact input[type=range]:active::-webkit-slider-thumb { width: 20px; height: 12px; }
+  .panel.compact input[type=range]::-moz-range-thumb { width: 12px; height: 8px; }
+  .panel.compact input[type=range]:hover::-moz-range-thumb, .panel.compact input[type=range]:active::-moz-range-thumb { width: 20px; height: 12px; }
+
+  /* liquid morph popouts (fixed, JS-anchored to buttons) */
+  .pop {
+    position: fixed; z-index: 45;
+    width: 158px; padding: 8px 9px; border-radius: 6px;
+    background: var(--panel-bg, rgba(8,10,14,.55));
+    backdrop-filter: blur(20px) saturate(1.35);
+    -webkit-backdrop-filter: blur(20px) saturate(1.35);
+    box-shadow: 0 8px 26px rgba(0,0,0,.4), inset 0 0 0 1px var(--panel-border, rgba(255,255,255,.12));
+    color: var(--panel-fg, rgba(255,255,255,.92));
+    font-size: 8.5px; line-height: 1.45;
+    opacity: 0; visibility: hidden;
+    transform-origin: right bottom;
+  }
+  .pop::after {
+    content: ''; position: absolute; right: -5px; bottom: 11px;
+    width: 9px; height: 9px; transform: rotate(45deg);
+    background: var(--panel-bg, rgba(8,10,14,.55));
+    border-top: 1px solid var(--panel-border, rgba(255,255,255,.12));
+    border-right: 1px solid var(--panel-border, rgba(255,255,255,.12));
+  }
+  .pop.show { opacity: 1; visibility: visible; animation: popMorph .34s cubic-bezier(.34,1.56,.64,1) both; }
+  #resetPop { transform-origin: center; }
+  #resetPop::after { display: none; }
+  @keyframes popMorph {
+    0%   { transform: scale(.5,.35); border-radius: 18px; opacity: 0; }
+    55%  { transform: scale(1.05,1.12); border-radius: 10px; opacity: 1; }
+    100% { transform: scale(1,1); border-radius: 6px; }
+  }
+  .pop .pop-action {
+    width: 100%; margin-top: 6px; padding: 4px 0;
+    border: 0; border-radius: 4px; cursor: pointer;
+    background: var(--panel-chip, rgba(255,255,255,.1)); color: var(--panel-fg, rgba(255,255,255,.9));
+    font-size: 8.5px; letter-spacing: .06em;
+  }
+  .pop .pop-action:hover { background: var(--panel-chip-hi, rgba(255,255,255,.2)); }
+  #dlBtn svg { vertical-align: -1px; margin-right: 4px; }
+
+  /* code preview box */
+  .code-line {
+    position: absolute; left: -1px; top: 8px; width: 2px; height: calc(100% - 16px);
+    background: var(--panel-fg, rgba(255,255,255,.85)); border-radius: 1px;
+    transform: scaleY(0); transform-origin: top center;
+    transition: transform .3s ease;
+  }
+  .panel.compact .code-line { transform: scaleY(1); }
+  .code-box {
+    position: fixed; top: 44px; bottom: 70px; left: auto; right: 176px; z-index: 18;
+    width: 0; border-radius: 6px; overflow: hidden;
+    background: var(--panel-bg, rgba(8,10,14,.5));
+    backdrop-filter: blur(20px) saturate(1.35);
+    -webkit-backdrop-filter: blur(20px) saturate(1.35);
+    box-shadow: 0 10px 30px rgba(0,0,0,.35), inset 0 0 0 1px var(--panel-border, rgba(255,255,255,.12));
+    opacity: 0; visibility: hidden;
+    transition: width .34s cubic-bezier(.22,1,.36,1) .24s, right .34s cubic-bezier(.22,1,.36,1) .24s, top .3s ease, bottom .3s ease, opacity .18s ease, visibility 0s .45s;
+  }
+  .code-box.open {
+    opacity: 1; visibility: visible;
+    transition: width .34s cubic-bezier(.22,1,.36,1) .24s, right .34s cubic-bezier(.22,1,.36,1) .24s, top .3s ease, bottom .3s ease, opacity .18s ease .24s, visibility 0s;
+  }
+  .code-box .inner {
+    height: 100%; transform: translateX(24px); opacity: 0;
+    transition: transform .34s cubic-bezier(.22,1,.36,1) .44s, opacity .24s ease .48s;
+  }
+  .code-box.open .inner { transform: translateX(0); opacity: 1; }
+  .code-box pre {
+    height: 100%; margin: 0; padding: 12px 14px; overflow: auto;
+    font: 10px/1.55 ui-monospace, Menlo, Consolas, monospace;
+    color: var(--panel-fg, rgba(255,255,255,.85));
+    white-space: pre; background: transparent; box-sizing: border-box;
+    scrollbar-width: thin;
+    padding-bottom: 40px;
+  }
+  .code-close {
+    position: absolute; bottom: 14px; right: 16px; z-index: 2;
+    border: 0; cursor: pointer; padding: 3px 8px; border-radius: 4px;
+    background: var(--panel-chip, rgba(255,255,255,.1)); color: var(--panel-fg, rgba(255,255,255,.9));
+    font-size: 8.5px; letter-spacing: .06em;
+  }
+  .code-close:hover { background: var(--panel-chip-hi, rgba(255,255,255,.2)); }
+
+  .panel h2 { font-size: 8.5px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--panel-dim, rgba(255,255,255,.45)); margin: 8px 0 3px; }
+  .panel h2:first-child { margin-top: 0; }
+  .prow { margin-bottom: 4px; }
+  .plabel { display: flex; justify-content: space-between; margin-bottom: 1px; color: var(--panel-dim, rgba(255,255,255,.6)); }
+  .pval { color: var(--panel-fg, #fff); font-variant-numeric: tabular-nums; }
+  .panel input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    --tw: 15px;
+    width: 100%; height: 3px; margin: 6px 0; border-radius: 2px;
+    background: linear-gradient(90deg, var(--track-b, rgba(255,255,255,.5)) var(--fill, 50%), transparent var(--fill, 50%));
+    cursor: pointer; outline: none;
+  }
+  .panel input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 15px; height: 10px; border-radius: 6px;
+    background: var(--panel-fg, #fff);
+    border: 0;
+    box-shadow: 0 1px 4px rgba(0,0,0,.4);
+    transition: width .16s ease, height .16s ease, border-radius .16s ease, background .16s ease, box-shadow .16s ease;
+  }
+  .panel input[type=range]:hover::-webkit-slider-thumb,
+  .panel input[type=range]:active::-webkit-slider-thumb {
+    width: 26px; height: 16px; border-radius: 8px;
+    background: rgba(255,255,255,.08);
+    backdrop-filter: url(#lg-thumb);
+    -webkit-backdrop-filter: url(#lg-thumb);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,.8), inset 0 -2px 5px rgba(0,0,20,.35), 0 3px 10px rgba(0,0,0,.45);
+  }
+  .panel input[type=range]::-moz-range-track {
+    height: 3px; border-radius: 2px;
+    background: linear-gradient(90deg, var(--track-b, rgba(255,255,255,.5)) var(--fill, 50%), transparent var(--fill, 50%));
+  }
+  .panel input[type=range]::-moz-range-thumb {
+    width: 15px; height: 10px; border-radius: 6px; box-sizing: border-box;
+    background: var(--panel-fg, #fff);
+    border: 0;
+    box-shadow: 0 1px 4px rgba(0,0,0,.4);
+    transition: all .16s ease;
+  }
+  .panel input[type=range]:hover::-moz-range-thumb,
+  .panel input[type=range]:active::-moz-range-thumb {
+    width: 26px; height: 16px; border-radius: 8px;
+    background: rgba(255,255,255,.15);
+    backdrop-filter: blur(4px) saturate(1.8) brightness(1.15);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,.8), inset 0 -2px 5px rgba(0,0,20,.35), 0 3px 10px rgba(0,0,0,.45);
+  }
+  .panel input[type=color] { width: 18px; height: 12px; border: 1px solid var(--panel-border, rgba(255,255,255,.25)); border-radius: 3px; padding: 0; background: transparent; cursor: pointer; vertical-align: middle; }
+  .reset-btn {
+    width: 100%; margin-top: 7px; padding: 5px 0;
+    border: 0; border-radius: 4px; cursor: pointer;
+    background: var(--panel-chip, rgba(255,255,255,.1)); color: var(--panel-fg, rgba(255,255,255,.9));
+    font-size: 10px; letter-spacing: .06em;
+  }
+  .reset-btn:hover { background: var(--panel-chip-hi, rgba(255,255,255,.2)); }
+
+  .bottom-stack {
+    position: fixed; left: 0; right: 0; bottom: 14px; z-index: 20;
+    display: flex; flex-direction: column; align-items: center; gap: 5px;
+    pointer-events: none;
+  }
+  .verbs {
+    max-width: calc(100vw - 160px); margin: 0 auto; text-align: center;
+    font-size: 10.5px; font-weight: 600; letter-spacing: .24em; text-transform: uppercase;
+    color: var(--hint-fg, rgba(255,255,255,.85));
+    text-shadow: var(--hint-shadow, 0 1px 4px rgba(0,0,0,.5));
+  }
+  .hint {
+    max-width: calc(100vw - 160px); margin: 0 auto; text-align: center;
+    font-size: 8.5px; letter-spacing: .02em;
+    color: var(--hint-fg, rgba(255,255,255,.85));
+    text-shadow: var(--hint-shadow, 0 1px 4px rgba(0,0,0,.5));
+  }
+  @media (max-width: 640px) {
+    .why { font-size: 7.5px; max-width: 146px; top: 6px; left: 6px; line-height: 1.36; }
+    .bottom-stack { bottom: 6px; gap: 2px; }
+    .hint { font-size: 6px; max-width: calc(100vw - 120px); }
+    .verbs { font-size: 7px; letter-spacing: .13em; max-width: calc(100vw - 120px); }
+    .corner-btn { font-size: 7.5px; padding: 4px 6px; }
+    .panel { padding: 5px 6px 5px; font-size: 7.5px; top: 30px; border-radius: 4px; }
+    .panel.open { width: 148px; max-height: calc(100vh - 80px); }
+    .panel-in { width: 136px; }
+    .panel.compact .panel-in { width: 100px; }
+    .panel.compact { width: 112px; }
+    .code-box { top: 36px; bottom: 56px; border-radius: 4px; }
+    .code-box.open { width: calc(100vw - 136px); }
+    .code-box pre { font-size: 8.5px; padding: 10px; }
+    .pop { width: 132px; font-size: 7.5px; }
+    .panel h2 { font-size: 6.5px; margin: 5px 0 1px; }
+    .prow { margin-bottom: 2px; }
+    .plabel { margin-bottom: 0; }
+    .panel input[type=range] { height: 2px; margin: 4px 0; --tw: 12px; }
+    .panel input[type=range]::-webkit-slider-thumb { width: 12px; height: 8px; border-radius: 5px; }
+    .panel input[type=range]:hover::-webkit-slider-thumb, .panel input[type=range]:active::-webkit-slider-thumb { width: 20px; height: 12px; border-radius: 6px; }
+    .panel input[type=range]::-moz-range-track { height: 2px; }
+    .panel input[type=range]::-moz-range-thumb { width: 12px; height: 8px; border-radius: 5px; }
+    .panel input[type=range]:hover::-moz-range-thumb, .panel input[type=range]:active::-moz-range-thumb { width: 20px; height: 12px; border-radius: 6px; }
+    .panel input[type=color] { width: 12px; height: 8px; }
+    .reset-btn { font-size: 7.5px; padding: 3px 0; margin-top: 3px; }
+    .sim-launch { padding: 3px 7px; font-size: 7px; }
+    .glass-label { font-size: 9px; }
+  }
+
+</style>
+</head>
+<body>
+  <div class="bg-layer active" id="bgA"></div>
+  <div class="bg-layer" id="bgB"></div>
+  <canvas class="sim-layer" id="simCanvas"></canvas>
+  <button class="sim-launch" id="simLaunch" aria-label="relaunch bouncing balls">launch</button>
+
+
+  <div class="float">
+    <div id="gc">
+      <div id="drag"></div>
+      <span class="glass-label">Liquid Glass</span>
+    </div>
+  </div>
+
+  <div class="why" id="whyBox">
+    <div class="why-toggle" id="whyToggle">why I built this <span class="caret">&#9662;</span></div>
+    <div class="why-body">
+      <span>I built this to help people develop custom, personalized liquid glass UI, because AI can't do it yet. it hasn't been trained on liquid glass, so everything so far has been reverse engineered by hand. this is a fun experiment, and a place to explore more forms of glass UI with the actual code behind it.</span>
+    </div>
+  </div>
+
+  <div class="grain"></div>
+
+  <button class="corner-btn menu-btn" id="menuToggle" aria-label="open tuning panel">tune</button>
+  <button class="corner-btn bg-btn" id="bgSwitch" aria-label="switch background scene">&#10095; <span id="bgCount">1/9</span></button>
+
+  <div class="panel" id="panel">
+    <div class="code-line"></div>
+    <div class="panel-in">
+    <h2>Shape</h2>
+    <div class="prow">
+      <div class="plabel">corner radius <span class="pval" id="vRadius">48</span></div>
+      <input type="range" id="sRadius" min="8" max="140" value="48">
+    </div>
+    <div class="prow">
+      <div class="plabel">glass size <span class="pval" id="vSize">280</span></div>
+      <input type="range" id="sSize" min="180" max="480" value="280">
+    </div>
+    <h2>Refraction</h2>
+    <div class="prow">
+      <div class="plabel">thickness <span class="pval" id="vThick">80</span></div>
+      <input type="range" id="sThick" min="10" max="200" value="80">
+    </div>
+    <div class="prow">
+      <div class="plabel">bezel width <span class="pval" id="vBezel">60</span></div>
+      <input type="range" id="sBezel" min="2" max="60" value="60">
+    </div>
+    <div class="prow">
+      <div class="plabel">refractive index <span class="pval" id="vIor">1.80</span></div>
+      <input type="range" id="sIor" min="1" max="3" step="0.05" value="1.8">
+    </div>
+    <div class="prow">
+      <div class="plabel">scale <span class="pval" id="vScale">1.00</span></div>
+      <input type="range" id="sScale" min="0" max="2" step="0.05" value="1">
+    </div>
+    <h2>Appearance</h2>
+    <div class="prow">
+      <div class="plabel">blur <span class="pval" id="vFBlur">0.3</span></div>
+      <input type="range" id="sFBlur" min="0" max="8" step="0.1" value="0.3">
+    </div>
+    <div class="prow">
+      <div class="plabel">specular opacity <span class="pval" id="vSpecOp">0.50</span></div>
+      <input type="range" id="sSpecOp" min="0" max="1" step="0.05" value="0.5">
+    </div>
+    <div class="prow">
+      <div class="plabel">specular saturation <span class="pval" id="vSpecSat">1.4</span></div>
+      <input type="range" id="sSpecSat" min="0" max="12" step="0.1" value="1.4">
+    </div>
+    <h2>Inner shadow</h2>
+    <div class="prow">
+      <div class="plabel">color <input type="color" id="sShColor" value="#ffffff"></div>
+    </div>
+    <div class="prow">
+      <div class="plabel">blur <span class="pval" id="vShBlur">20</span></div>
+      <input type="range" id="sShBlur" min="0" max="40" value="20">
+    </div>
+    <div class="prow">
+      <div class="plabel">spread <span class="pval" id="vShSpread">-5</span></div>
+      <input type="range" id="sShSpread" min="-15" max="10" value="-5">
+    </div>
+    <h2>Tint</h2>
+    <div class="prow">
+      <div class="plabel">color <input type="color" id="sTintColor" value="#ffffff"></div>
+    </div>
+    <div class="prow">
+      <div class="plabel">opacity <span class="pval" id="vTintOp">6%</span></div>
+      <input type="range" id="sTintOp" min="0" max="40" value="6">
+    </div>
+    <h2>Outer shadow</h2>
+    <div class="prow">
+      <div class="plabel">blur <span class="pval" id="vOutBlur">24</span></div>
+      <input type="range" id="sOutBlur" min="0" max="50" value="24">
+    </div>
+    <button class="reset-btn" id="resetBtn" aria-label="reset all settings to defaults">reset</button>
+    <button class="reset-btn" id="dlBtn" style="margin-top:6px" aria-label="download tuned code as HTML file"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11m0 0l-4-4m4 4l4-4M5 21h14"/></svg>download code</button>
+    </div>
+  </div>
+
+  <div class="pop" id="resetPop">this returns to the default values Michael To prefers on his own designs.
+    <button class="pop-action" id="resetConfirm">confirm reset</button>
+    <button class="pop-action" id="resetCancel">cancel</button>
+  </div>
+  <div class="pop" id="dlPop">exports this exact tuned glass as a standalone HTML file.
+    <button class="pop-action" id="previewBtn">preview code</button>
+  </div>
+
+  <div class="code-box" id="codeBox">
+    <button class="code-close" id="codeClose" aria-label="close code preview">close</button>
+    <div class="inner"><pre id="codePre"></pre></div>
+  </div>
+
+  <div class="bottom-stack">
+    <div class="verbs">drag / pinch / throw</div>
+    <div class="hint">liquid glass &middot; adjustable custom UI/UX development module &middot; by Michael To &middot; v1.0</div>
+  </div>
+
+  <svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="position:absolute;overflow:hidden" color-interpolation-filters="sRGB">
+    <defs id="svgDefs"></defs>
+  </svg>
+
+<script>
+/* ===== chromium check: the SVG-filter backdrop trick needs Chromium ===== */
+if (!window.chrome) document.body.classList.add('no-refraction');
+
+/* ===== nature backgrounds (4K) with crossfade ===== */
+var BGS = [
+  "images/bg-1.jpg",
+  "images/bg-2.jpg",
+  "images/bg-3.jpg",
+  "images/bg-4.jpg",
+  "images/bg-5.jpg",
+  "images/bg-6.jpg",
+  "images/bg-7.jpg",
+  "images/bg-8.jpg"
+];
+var FALLBACK = "https://picsum.photos/id/10/3840/2160";
+var bgIdx = 0, bgFront = true, currentBgUrl = BGS[0];
+var layerA = document.getElementById("bgA"), layerB = document.getElementById("bgB");
+var bgCount = document.getElementById("bgCount");
+function adaptFromSource(src) {
+    try {
+      var s = 24, c = document.createElement("canvas");
+      c.width = s; c.height = s;
+      var ctx = c.getContext("2d");
+      ctx.drawImage(src, 0, 0, s, s);
+      var d = ctx.getImageData(0, 0, s, s).data;
+      var r = 0, g = 0, b = 0, n = 0, i;
+      for (i = 0; i < d.length; i += 4) { r += d[i]; g += d[i+1]; b += d[i+2]; n++; }
+      r = Math.round(r / n); g = Math.round(g / n); b = Math.round(b / n);
+      var rgb = r + "," + g + "," + b;
+      var root = document.documentElement.style;
+      root.setProperty("--tint-color", rgb);
+      root.setProperty("--shadow-color", "rgba(" + rgb + ",0.45)");
+      var lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      if (lum > 140) {
+        root.setProperty("--why-fg", "rgba(12,14,18,.94)");
+        root.setProperty("--why-shadow", "0 1px 6px rgba(255,255,255,.4)");
+        root.setProperty("--hint-fg", "rgba(12,14,18,.8)");
+        root.setProperty("--hint-shadow", "0 1px 4px rgba(255,255,255,.35)");
+        root.setProperty("--panel-bg", "rgba(255,255,255,.45)");
+        root.setProperty("--panel-border", "rgba(0,0,0,.14)");
+        root.setProperty("--panel-fg", "rgba(10,12,16,.95)");
+        root.setProperty("--panel-dim", "rgba(10,12,16,.52)");
+        root.setProperty("--panel-chip", "rgba(0,0,0,.08)");
+        root.setProperty("--panel-chip-hi", "rgba(0,0,0,.16)");
+        root.setProperty("--track-a", "rgba(0,0,0,.14)");
+        root.setProperty("--track-b", "rgba(0,0,0,.5)");
+      } else {
+        root.setProperty("--why-fg", "rgba(255,255,255,.92)");
+        root.setProperty("--why-shadow", "0 1px 6px rgba(0,0,0,.5)");
+        root.setProperty("--hint-fg", "rgba(255,255,255,.85)");
+        root.setProperty("--hint-shadow", "0 1px 4px rgba(0,0,0,.5)");
+        root.setProperty("--panel-bg", "rgba(8,10,14,.48)");
+        root.setProperty("--panel-border", "rgba(255,255,255,.12)");
+        root.setProperty("--panel-fg", "rgba(255,255,255,.92)");
+        root.setProperty("--panel-dim", "rgba(255,255,255,.5)");
+        root.setProperty("--panel-chip", "rgba(255,255,255,.1)");
+        root.setProperty("--panel-chip-hi", "rgba(255,255,255,.2)");
+        root.setProperty("--track-a", "rgba(255,255,255,.1)");
+        root.setProperty("--track-b", "rgba(255,255,255,.5)");
+      }
+      function hx(v) { var x = v.toString(16); return x.length < 2 ? "0" + x : x; }
+      var hex = "#" + hx(r) + hx(g) + hx(b);
+      document.getElementById("sShColor").value = hex;
+      document.getElementById("sTintColor").value = hex;
+    } catch (e) {}
+}
+function adaptGlassTo(url) {
+  var img = new Image();
+  img.crossOrigin = "anonymous";
+  img.onload = function () { adaptFromSource(img); };
+  img.src = url;
+}
+function setBg(el, url, onload) {
+  var probe = new Image();
+  probe.onload = function () { el.style.backgroundImage = "url(" + url + ")"; currentBgUrl = url; adaptGlassTo(url); if (onload) onload(); };
+  probe.onerror = function () { el.style.backgroundImage = "url(" + FALLBACK + ")"; currentBgUrl = FALLBACK; adaptGlassTo(FALLBACK); if (onload) onload(); };
+  probe.src = url;
+}
+setBg(layerA, BGS[0]);
+BGS.forEach(function (u) { var i = new Image(); i.src = u; });
+var SCENES = BGS.concat(["__sim__"]);
+var simCanvas = document.getElementById("simCanvas");
+var simLaunch = document.getElementById("simLaunch");
+simLaunch.addEventListener("click", function () {
+  if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function") {
+    DeviceOrientationEvent.requestPermission().catch(function () {});
+  }
+  initBalls();
+});
+document.getElementById("bgSwitch").addEventListener("click", function () {
+  bgIdx = (bgIdx + 1) % SCENES.length;
+  var scene = SCENES[bgIdx];
+  if (scene === "__sim__") {
+    layerA.classList.remove("active");
+    layerB.classList.remove("active");
+    simCanvas.classList.add("active");
+    SIM.active = true;
+    simLaunch.classList.add("show");
+    initBalls();
+    adaptFromSource(simCanvas);
+  } else {
+    simCanvas.classList.remove("active");
+    SIM.active = false;
+    simLaunch.classList.remove("show");
+    var show = bgFront ? layerB : layerA, hide = bgFront ? layerA : layerB;
+    bgFront = !bgFront;
+    setBg(show, scene, function () {
+      hide.classList.remove("active");
+      show.classList.add("active");
+    });
+  }
+  bgCount.textContent = (bgIdx + 1) + "/" + SCENES.length;
+});
+
+/* ===== refraction engine (adapted from archisvaze/liquid-glass) ===== */
+var SURFACE_FNS = {
+  convex_squircle: function (x) { return Math.pow(1 - Math.pow(1 - x, 4), 0.25); }
+};
+function calculateRefractionProfile(glassThickness, bezelWidth, heightFn, ior, samples) {
+  samples = samples || 128;
+  var eta = 1 / ior;
+  function refract(nx, ny) {
+    var dot = ny;
+    var k = 1 - eta * eta * (1 - dot * dot);
+    if (k < 0) return null;
+    var sq = Math.sqrt(k);
+    return [-(eta * dot + sq) * nx, eta - (eta * dot + sq) * ny];
+  }
+  var profile = new Float64Array(samples);
+  for (var i = 0; i < samples; i++) {
+    var x = i / samples;
+    var y = heightFn(x);
+    var dx = x < 1 ? 0.0001 : -0.0001;
+    var y2 = heightFn(x + dx);
+    var deriv = (y2 - y) / dx;
+    var mag = Math.sqrt(deriv * deriv + 1);
+    var ref = refract(-deriv / mag, -1 / mag);
+    if (!ref) { profile[i] = 0; continue; }
+    profile[i] = ref[0] * ((y * bezelWidth + glassThickness) / ref[1]);
+  }
+  return profile;
+}
+function generateDisplacementMap(w, h, radius, bezelWidth, profile, maxDisp) {
+  var c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  var ctx = c.getContext("2d");
+  var img = ctx.createImageData(w, h);
+  var d = img.data;
+  for (var i = 0; i < d.length; i += 4) { d[i] = 128; d[i+1] = 128; d[i+2] = 0; d[i+3] = 255; }
+  var r = radius, rSq = r * r, r1Sq = (r + 1) * (r + 1);
+  var rBSq = Math.max(r - bezelWidth, 0) * Math.max(r - bezelWidth, 0);
+  var wB = w - r * 2, hB = h - r * 2, S = profile.length;
+  for (var y1 = 0; y1 < h; y1++) {
+    for (var x1 = 0; x1 < w; x1++) {
+      var x = x1 < r ? x1 - r : x1 >= w - r ? x1 - r - wB : 0;
+      var y = y1 < r ? y1 - r : y1 >= h - r ? y1 - r - hB : 0;
+      var dSq = x * x + y * y;
+      if (dSq > r1Sq || dSq < rBSq) continue;
+      var dist = Math.sqrt(dSq);
+      var fromSide = r - dist;
+      var op = dSq < rSq ? 1 : 1 - (dist - Math.sqrt(rSq)) / (Math.sqrt(r1Sq) - Math.sqrt(rSq));
+      if (op <= 0 || dist === 0) continue;
+      var cos = x / dist, sin = y / dist;
+      var bi = Math.min(((fromSide / bezelWidth) * S) | 0, S - 1);
+      var disp = profile[bi] || 0;
+      var dX = (-cos * disp) / maxDisp, dY = (-sin * disp) / maxDisp;
+      var idx = (y1 * w + x1) * 4;
+      d[idx] = (128 + dX * 127 * op + 0.5) | 0;
+      d[idx + 1] = (128 + dY * 127 * op + 0.5) | 0;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return c.toDataURL();
+}
+function generateSpecularMap(w, h, radius, bezelWidth, angle) {
+  angle = (angle != null) ? angle : Math.PI / 3;
+  var c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  var ctx = c.getContext("2d");
+  var img = ctx.createImageData(w, h);
+  var d = img.data;
+  d.fill(0);
+  var r = radius, rSq = r * r, r1Sq = (r + 1) * (r + 1);
+  var rBSq = Math.max(r - bezelWidth, 0) * Math.max(r - bezelWidth, 0);
+  var wB = w - r * 2, hB = h - r * 2;
+  var sv = [Math.cos(angle), Math.sin(angle)];
+  for (var y1 = 0; y1 < h; y1++) {
+    for (var x1 = 0; x1 < w; x1++) {
+      var x = x1 < r ? x1 - r : x1 >= w - r ? x1 - r - wB : 0;
+      var y = y1 < r ? y1 - r : y1 >= h - r ? y1 - r - hB : 0;
+      var dSq = x * x + y * y;
+      if (dSq > r1Sq || dSq < rBSq) continue;
+      var dist = Math.sqrt(dSq);
+      var fromSide = r - dist;
+      var op = dSq < rSq ? 1 : 1 - (dist - Math.sqrt(rSq)) / (Math.sqrt(r1Sq) - Math.sqrt(rSq));
+      if (op <= 0 || dist === 0) continue;
+      var cos = x / dist, sin = -y / dist;
+      var dot = Math.abs(cos * sv[0] + sin * sv[1]);
+      var edge = Math.sqrt(Math.max(0, 1 - (1 - fromSide) * (1 - fromSide)));
+      var coeff = dot * edge;
+      var col = (255 * coeff) | 0;
+      var alpha = (col * coeff * op) | 0;
+      var idx = (y1 * w + x1) * 4;
+      d[idx] = col; d[idx + 1] = col; d[idx + 2] = col; d[idx + 3] = alpha;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return c.toDataURL();
+}
+
+var gc = document.getElementById("gc");
+var mapCache = {};
+function val(id) { return +document.getElementById(id).value; }
+function hexToRgb(hex) {
+  return parseInt(hex.slice(1, 3), 16) + "," + parseInt(hex.slice(3, 5), 16) + "," + parseInt(hex.slice(5, 7), 16);
+}
+function rebuildFilter(hi) {
+  if (document.body.classList.contains("no-refraction")) return;
+  var w = gc.offsetWidth, h = gc.offsetHeight;
+  if (w < 2 || h < 2) return;
+  hi = !!hi;
+  var f = hi ? 1 : 2;   /* f=2: half-res maps while dragging, f=1: full-res when settled */
+  var glassThick = val("sThick");
+  var bezelW = val("sBezel");
+  var ior = val("sIor");
+  var scaleRatio = val("sScale");
+  var blurAmt = val("sFBlur");
+  var specOpacity = val("sSpecOp");
+  var specSat = val("sSpecSat");
+  var radius = Math.min(val("sRadius"), w / 2, h / 2);
+  var heightFn = SURFACE_FNS.convex_squircle;
+  var clampedBezel = Math.max(1, Math.min(bezelW, radius - 1, Math.min(w, h) / 2 - 1));
+  /* half-resolution maps + parameter cache: same look, ~4x faster, instant on repeat sizes */
+  var cacheKey = w + "|" + h + "|" + radius + "|" + clampedBezel + "|" + ior + "|" + glassThick + "|" + (hi ? 1 : 0);
+  var cached = mapCache[cacheKey], dispUrl, specUrl, scale;
+  if (cached) {
+    dispUrl = cached.d; specUrl = cached.s; scale = cached.k;
+  } else {
+    var mw = Math.ceil(w / f), mh = Math.ceil(h / f);
+    var profile = calculateRefractionProfile(glassThick / f, clampedBezel / f, heightFn, ior, 128);
+    var maxDisp = 1, i;
+    for (i = 0; i < profile.length; i++) if (Math.abs(profile[i]) > maxDisp) maxDisp = Math.abs(profile[i]);
+    dispUrl = generateDisplacementMap(mw, mh, radius / f, clampedBezel / f, profile, maxDisp);
+    specUrl = generateSpecularMap(mw, mh, radius / f, clampedBezel * 2.5 / f);
+    scale = maxDisp * f * scaleRatio;
+    if (Object.keys(mapCache).length > 40) mapCache = {};
+    mapCache[cacheKey] = { d: dispUrl, s: specUrl, k: scale };
+  }
+  /* thumb-sized liquid glass filter (same engine, small maps) */
+  var thumbFilter = "";
+  try {
+    var tBezel = Math.min(7, 8 - 1);
+    var tProfile = calculateRefractionProfile(glassThick, tBezel, heightFn, ior, 64);
+    var tMax = 1;
+    for (i = 0; i < tProfile.length; i++) if (Math.abs(tProfile[i]) > tMax) tMax = Math.abs(tProfile[i]);
+    var tDisp = generateDisplacementMap(64, 40, 8, tBezel, tProfile, tMax);
+    var tSpec = generateSpecularMap(64, 40, 8, tBezel * 2.5);
+    var tScale = tMax * 0.9;
+    thumbFilter =
+      '<filter id="lg-thumb" x="0%" y="0%" width="100%" height="100%">' +
+      '<feGaussianBlur in="SourceGraphic" stdDeviation="0.2" result="blurred_source" />' +
+      '<feImage href="' + tDisp + '" x="0" y="0" width="64" height="40" result="disp_map" />' +
+      '<feDisplacementMap in="blurred_source" in2="disp_map" scale="' + tScale + '" xChannelSelector="R" yChannelSelector="G" result="displaced" />' +
+      '<feColorMatrix in="displaced" type="saturate" values="1.3" result="displaced_sat" />' +
+      '<feImage href="' + tSpec + '" x="0" y="0" width="64" height="40" result="spec_layer" />' +
+      '<feComposite in="displaced_sat" in2="spec_layer" operator="in" result="spec_masked" />' +
+      '<feComponentTransfer in="spec_layer" result="spec_faded"><feFuncA type="linear" slope="0.6" /></feComponentTransfer>' +
+      '<feBlend in="spec_masked" in2="displaced" mode="normal" result="with_sat" />' +
+      '<feBlend in="spec_faded" in2="with_sat" mode="normal" />' +
+      '</filter>';
+  } catch (e) {}
+  document.getElementById("svgDefs").innerHTML =
+    '<filter id="liquid-glass-filter" x="0%" y="0%" width="100%" height="100%">' +
+    '<feGaussianBlur in="SourceGraphic" stdDeviation="' + blurAmt + '" result="blurred_source" />' +
+    '<feImage href="' + dispUrl + '" x="0" y="0" width="' + w + '" height="' + h + '" result="disp_map" />' +
+    '<feDisplacementMap in="blurred_source" in2="disp_map" scale="' + scale + '" xChannelSelector="R" yChannelSelector="G" result="displaced" />' +
+    '<feColorMatrix in="displaced" type="saturate" values="' + specSat + '" result="displaced_sat" />' +
+    '<feImage href="' + specUrl + '" x="0" y="0" width="' + w + '" height="' + h + '" result="spec_layer" />' +
+    '<feComposite in="displaced_sat" in2="spec_layer" operator="in" result="spec_masked" />' +
+    '<feComponentTransfer in="spec_layer" result="spec_faded"><feFuncA type="linear" slope="' + specOpacity + '" /></feComponentTransfer>' +
+    '<feBlend in="spec_masked" in2="displaced" mode="normal" result="with_sat" />' +
+    '<feBlend in="spec_faded" in2="with_sat" mode="normal" />' +
+    '</filter>' + thumbFilter;
+}
+function updateCSS() {
+  var root = document.documentElement.style;
+  root.setProperty("--glass-radius", val("sRadius") + "px");
+  root.setProperty("--shadow-color", "rgba(" + hexToRgb(document.getElementById("sShColor").value) + ",0.45)");
+  root.setProperty("--shadow-blur", val("sShBlur") + "px");
+  root.setProperty("--shadow-spread", val("sShSpread") + "px");
+  root.setProperty("--tint-color", hexToRgb(document.getElementById("sTintColor").value));
+  root.setProperty("--tint-opacity", (val("sTintOp") / 100).toFixed(3));
+  root.setProperty("--outer-shadow-blur", val("sOutBlur") + "px");
+  root.setProperty("--gsize", val("sSize") + "px");
+}
+
+/* ===== tune panel ===== */
+var IS_MOBILE = window.matchMedia("(max-width: 640px)").matches;
+var SIZE_MIN = IS_MOBILE ? 120 : 180;
+var SIZE_MAX = IS_MOBILE ? 340 : 480;
+var DEFAULT_SIZE = IS_MOBILE ? 200 : 280;
+var glassSize = DEFAULT_SIZE;
+var sSizeEl = document.getElementById("sSize");
+sSizeEl.min = SIZE_MIN; sSizeEl.max = SIZE_MAX; sSizeEl.value = DEFAULT_SIZE;
+document.getElementById("vSize").textContent = DEFAULT_SIZE;
+document.documentElement.style.setProperty("--gsize", DEFAULT_SIZE + "px");
+function setSize(v) {
+  v = Math.max(SIZE_MIN, Math.min(SIZE_MAX, Math.round(v)));
+  if (v === glassSize) return;
+  glassSize = v;
+  sSizeEl.value = v;
+  document.getElementById("vSize").textContent = v;
+  syncFill(sSizeEl);
+  updateCSS();
+  rebuildNow();
+}
+var panel = document.getElementById("panel");
+document.getElementById("menuToggle").addEventListener("click", function () {
+  var willOpen = !panel.classList.contains("open");
+  panel.classList.toggle("open");
+  if (!willOpen && previewOpen) closePreview();
+  requestAnimationFrame(syncCodeBox);
+});
+document.getElementById("whyToggle").addEventListener("click", function () {
+  document.getElementById("whyBox").classList.toggle("open");
+});
+
+var REBUILD_IDS = { sThick:1, sBezel:1, sIor:1, sScale:1, sFBlur:1, sSpecOp:1, sSpecSat:1, sRadius:1 };
+var CSS_IDS = { sRadius:1, sShBlur:1, sShSpread:1, sTintOp:1, sOutBlur:1, sSize:1 };
+var FMT = {
+  sRadius:function(v){return Math.round(v);}, sThick:function(v){return Math.round(v);},
+  sBezel:function(v){return Math.round(v);}, sIor:function(v){return (+v).toFixed(2);},
+  sScale:function(v){return (+v).toFixed(2);}, sFBlur:function(v){return (+v).toFixed(1);},
+  sSpecOp:function(v){return (+v).toFixed(2);}, sSpecSat:function(v){return (+v).toFixed(1);},
+  sShBlur:function(v){return Math.round(v);}, sShSpread:function(v){return Math.round(v);},
+  sSize:function(v){return Math.round(v);},
+  sTintOp:function(v){return Math.round(v)+"%";}, sOutBlur:function(v){return Math.round(v);}
+};
+function syncFill(s) {
+  var min = +s.min || 0, max = +s.max || 100, v = +s.value;
+  var p = (v - min) / (max - min);
+  var w = s.clientWidth || 100;
+  var tw = parseFloat(getComputedStyle(s).getPropertyValue("--tw")) || 15;
+  /* webkit anchors the thumb by its left edge: center = tw/2 + p*(w - tw) */
+  var pct = (tw / 2 + p * (w - tw)) / w * 100;
+  s.style.setProperty("--fill", pct.toFixed(2) + "%");
+}
+var timer, rebuildPending = false;
+function scheduleRebuild() { clearTimeout(timer); timer = setTimeout(function () { rebuildFilter(true); }, 30); }
+function rebuildNow() {
+  clearTimeout(timer);
+  timer = setTimeout(function () { rebuildFilter(true); }, 220);
+  if (rebuildPending) return;
+  rebuildPending = true;
+  requestAnimationFrame(function () { rebuildPending = false; rebuildFilter(false); });
+}
+function refreshOutputs() {
+  Object.keys(FMT).forEach(function (id) {
+    var el = document.getElementById(id + "");
+    if (el) {
+      var v = document.getElementById("v" + id.slice(1));
+      if (v) v.textContent = FMT[id](el.value);
+      syncFill(el);
+    }
+  });
+}
+["sRadius","sSize","sThick","sBezel","sIor","sScale","sFBlur","sSpecOp","sSpecSat","sShBlur","sShSpread","sTintOp","sOutBlur"].forEach(function (id) {
+  document.getElementById(id).addEventListener("input", function () {
+    var out = document.getElementById("v" + id.slice(1));
+    if (out) out.textContent = FMT[id](this.value);
+    syncFill(this);
+    if (CSS_IDS[id]) updateCSS();
+    if (REBUILD_IDS[id]) rebuildNow();
+    refreshPreview();
+  });
+});
+Object.keys(FMT).forEach(function (id) { var el = document.getElementById(id); if (el) syncFill(el); });
+["sShColor","sTintColor"].forEach(function (id) {
+  document.getElementById(id).addEventListener("input", function () { updateCSS(); refreshPreview(); });
+});
+
+var DEFAULTS = { sRadius:48, sSize:DEFAULT_SIZE, sThick:80, sBezel:60, sIor:"1.8", sScale:"1", sFBlur:"0.3", sSpecOp:"0.5",
+                 sSpecSat:"1.4", sShColor:"#ffffff", sShBlur:20, sShSpread:-5, sTintColor:"#ffffff",
+                 sTintOp:6, sOutBlur:24 };
+/* ===== popout helpers: hover + touch + outside-click safe ===== */
+var resetPop = document.getElementById("resetPop");
+var dlPop = document.getElementById("dlPop");
+var resetBtn = document.getElementById("resetBtn");
+var dlBtn = document.getElementById("dlBtn");
+var hideTimer = null;
+function positionPop(pop, btn) {
+  clearTimeout(hideTimer);
+  (pop === resetPop ? dlPop : resetPop).classList.remove("show");
+  pop.classList.add("show");
+  var r = btn.getBoundingClientRect();
+  var pw = pop.offsetWidth, ph = pop.offsetHeight;
+  pop.style.left = Math.max(8, r.left - pw - 9) + "px";
+  pop.style.top = Math.max(8, Math.min(window.innerHeight - ph - 8, r.bottom - ph)) + "px";
+}
+function showPop(pop, btn) {
+  clearTimeout(hideTimer);
+  positionPop(pop, btn);
+}
+function hidePop(pop) {
+  clearTimeout(hideTimer);
+  hideTimer = setTimeout(function () { pop.classList.remove("show"); }, 140);
+}
+function togglePop(pop, btn) {
+  if (pop.classList.contains("show")) { clearTimeout(hideTimer); pop.classList.remove("show"); }
+  else positionPop(pop, btn);
+}
+[resetPop, dlPop].forEach(function (pop) {
+  pop.addEventListener("mouseenter", function () { clearTimeout(hideTimer); });
+  pop.addEventListener("mouseleave", function () { hidePop(pop); });
+});
+function positionPopCenter(pop) {
+  clearTimeout(hideTimer);
+  dlPop.classList.remove("show");
+  pop.classList.add("show");
+  var pw = pop.offsetWidth, ph = pop.offsetHeight;
+  pop.style.left = Math.max(8, (window.innerWidth - pw) / 2) + "px";
+  pop.style.top = Math.max(8, (window.innerHeight - ph) / 2 - 20) + "px";
+}
+function togglePopCenter(pop) {
+  if (pop.classList.contains("show")) { clearTimeout(hideTimer); pop.classList.remove("show"); }
+  else positionPopCenter(pop);
+}
+resetBtn.addEventListener("click", function () { togglePopCenter(resetPop); });
+dlBtn.addEventListener("mouseenter", function () { showPop(dlPop, dlBtn); });
+dlBtn.addEventListener("mouseleave", function () { hidePop(dlPop); });
+document.addEventListener("click", function (e) {
+  [resetPop, dlPop].forEach(function (pop) {
+    if (pop.classList.contains("show") && !pop.contains(e.target) &&
+        e.target !== resetBtn && e.target !== dlBtn && !resetBtn.contains(e.target) && !dlBtn.contains(e.target)) {
+      pop.classList.remove("show");
+    }
+  });
+});
+function runReset() {
+  Object.keys(DEFAULTS).forEach(function (id) {
+    document.getElementById(id).value = DEFAULTS[id];
+  });
+  refreshOutputs();
+  updateCSS();
+  if (SIM.active) adaptFromSource(simCanvas); else adaptGlassTo(currentBgUrl);
+  if (window.__resetGlassPos) window.__resetGlassPos();
+  scheduleRebuild();
+  refreshPreview();
+}
+document.getElementById("resetConfirm").addEventListener("click", function () {
+  resetPop.classList.remove("show");
+  runReset();
+});
+document.getElementById("resetCancel").addEventListener("click", function () {
+  resetPop.classList.remove("show");
+});
+
+/* ===== code preview ===== */
+var codeBox = document.getElementById("codeBox");
+var codePre = document.getElementById("codePre");
+var previewOpen = false;
+function refreshPreview() {
+  if (!previewOpen) return;
+  var st = codePre.scrollTop;
+  codePre.textContent = buildExport();
+  codePre.scrollTop = st;
+}
+function resyncFills() {
+  Object.keys(FMT).forEach(function (id) {
+    var el = document.getElementById(id);
+    if (el) syncFill(el);
+  });
+}
+function syncCodeBox() {
+  if (!previewOpen) return;
+  /* vertical geometry always follows the panel rect: height/position constant,
+     the box only reaches horizontally to fill when the panel is closed */
+  var r = panel.getBoundingClientRect();
+  codeBox.style.top = r.top + "px";
+  codeBox.style.bottom = (window.innerHeight - r.bottom) + "px";
+  if (panel.classList.contains("open")) {
+    codeBox.style.right = (window.innerWidth - r.left + 12) + "px";
+    codeBox.style.width = Math.max(0, r.left - 22) + "px";
+  } else {
+    codeBox.style.right = "10px";
+    codeBox.style.width = Math.max(0, window.innerWidth - 20) + "px";
+  }
+}
+function openPreview() {
+  refreshPreviewForce();
+  document.getElementById("whyBox").classList.remove("open");
+  panel.classList.add("open");
+  panel.classList.add("compact");
+  codeBox.classList.add("open");
+  previewOpen = true;
+  syncCodeBox();
+  requestAnimationFrame(resyncFills);
+}
+function refreshPreviewForce() {
+  codePre.textContent = buildExport();
+  codePre.scrollTop = 0;
+}
+function closePreview() {
+  panel.classList.remove("compact");
+  codeBox.classList.remove("open");
+  previewOpen = false;
+  requestAnimationFrame(resyncFills);
+}
+document.getElementById("previewBtn").addEventListener("click", function () {
+  dlPop.classList.remove("show");
+  if (previewOpen) closePreview(); else openPreview();
+});
+document.getElementById("codeClose").addEventListener("click", closePreview);
+if (window.ResizeObserver) new ResizeObserver(syncCodeBox).observe(panel);
+window.addEventListener("resize", syncCodeBox);
+
+window.addEventListener("DOMContentLoaded", function () {
+  updateCSS();
+  /* stagger delays for the panel scroll reveal */
+  var rows = document.querySelectorAll(".panel-in > *");
+  for (var ri = 0; ri < rows.length; ri++) {
+    rows[ri].style.setProperty("--d", Math.min(ri * 0.022, 0.55) + "s");
+  }
+  requestAnimationFrame(function () { requestAnimationFrame(function () { rebuildFilter(true); }); });
+});
+window.addEventListener("resize", function () {
+  clearTimeout(timer);
+  timer = setTimeout(function () { rebuildFilter(true); }, 150);
+  var mob = window.matchMedia("(max-width: 640px)").matches;
+  SIZE_MIN = mob ? 120 : 180; SIZE_MAX = mob ? 340 : 480;
+  sSizeEl.min = SIZE_MIN; sSizeEl.max = SIZE_MAX;
+  setSize(glassSize);
+  resyncFills();
+});
+
+/* ===== drag: full range, edge stop, centered bounds, inertia ===== */
+(function () {
+  var dragEl = document.getElementById("drag");
+  var ox = 0, oy = 0, vx = 0, vy = 0;
+  var dragging = false, gdx = 0, gdy = 0, lastMove = 0;
+  var ptrs = {}, pinch = null;
+  function ptrDist() {
+    var k = Object.keys(ptrs);
+    var a = ptrs[k[0]], b = ptrs[k[1]];
+    return Math.sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
+  }
+  function clampPos() {
+    var hw = gc.offsetWidth / 2 + 8, hh = gc.offsetHeight / 2 + 8;
+    var mx = Math.max(0, window.innerWidth / 2 - hw);
+    var my = Math.max(0, window.innerHeight / 2 - hh);
+    if (ox < -mx) { ox = -mx; vx = 0; }
+    if (ox >  mx) { ox =  mx; vx = 0; }
+    if (oy < -my) { oy = -my; vy = 0; }
+    if (oy >  my) { oy =  my; vy = 0; }
+  }
+  function apply() {
+    gc.style.setProperty("--dx", ox.toFixed(1) + "px");
+    gc.style.setProperty("--dy", oy.toFixed(1) + "px");
+  }
+  dragEl.addEventListener("pointerdown", function (e) {
+    ptrs[e.pointerId] = { x: e.clientX, y: e.clientY };
+    if (Object.keys(ptrs).length === 2) {
+      dragging = false;
+      gc.classList.remove("grabbing");
+      vx = vy = 0;
+      pinch = { d0: ptrDist(), s0: glassSize };
+      return;
+    }
+    var gr = gc.getBoundingClientRect();
+    gdx = e.clientX - (gr.left + gr.width / 2);
+    gdy = e.clientY - (gr.top + gr.height / 2);
+    dragging = true;
+    gc.classList.add("grabbing");
+    vx = vy = 0;
+    try { dragEl.setPointerCapture(e.pointerId); } catch (err) {}
+    e.preventDefault();
+  });
+  window.addEventListener("pointermove", function (e) {
+    if (ptrs[e.pointerId]) ptrs[e.pointerId] = { x: e.clientX, y: e.clientY };
+    if (pinch && Object.keys(ptrs).length >= 2) {
+      if (pinch.d0 > 0) setSize(pinch.s0 * ptrDist() / pinch.d0);
+      return;
+    }
+    if (!dragging) return;
+    lastMove = performance.now();
+    var gr = gc.getBoundingClientRect();
+    var hw = gr.width / 2 + 8, hh = gr.height / 2 + 8;
+    var nx = e.clientX - gdx, ny = e.clientY - gdy;
+    if (hw > window.innerWidth / 2) nx = window.innerWidth / 2;
+    else nx = Math.max(hw, Math.min(window.innerWidth - hw, nx));
+    if (hh > window.innerHeight / 2) ny = window.innerHeight / 2;
+    else ny = Math.max(hh, Math.min(window.innerHeight - hh, ny));
+    var newOx = nx - window.innerWidth / 2;
+    var newOy = ny - window.innerHeight / 2;
+    vx = newOx - ox; vy = newOy - oy;
+    ox = newOx; oy = newOy;
+    apply();
+  });
+  function release(e) {
+    if (e && ptrs[e.pointerId] !== undefined) delete ptrs[e.pointerId];
+    if (Object.keys(ptrs).length < 2) pinch = null;
+    if (Object.keys(ptrs).length === 0) {
+      dragging = false;
+      gc.classList.remove("grabbing");
+    }
+  }
+  window.addEventListener("pointerup", release);
+  window.addEventListener("pointercancel", release);
+  window.__resetGlassPos = function () { ox = 0; oy = 0; vx = 0; vy = 0; apply(); };
+  (function tick() {
+    var now = performance.now();
+    if (!dragging) {
+      ox += vx; oy += vy; vx *= 0.93; vy *= 0.93;
+      clampPos();
+      if (Math.abs(vx) > 0.05 || Math.abs(vy) > 0.05) apply();
+    } else if (now - lastMove > 90) {
+      vx *= 0.6; vy *= 0.6;
+    }
+    requestAnimationFrame(tick);
+  })();
+})();
+
+/* ===== 100 bouncing balls (velocity-based, pair collisions O(n^2/2), zero alloc) ===== */
+var SIM = { active: false, balls: [], t: 0 };
+var sctx = simCanvas.getContext("2d");
+var GRAV = 0.12, REST = 0.88, BREST = 0.92;
+function simResize() {
+  simCanvas.width = window.innerWidth;
+  simCanvas.height = window.innerHeight;
+}
+function initBalls() {
+  SIM.balls = []; SIM.t = 0;
+  var w = simCanvas.width, h = simCanvas.height, m = 40, i;
+  for (i = 0; i < 100; i++) {
+    SIM.balls.push({
+      x: m + Math.random() * (w - 2 * m),
+      y: m + Math.random() * (h * 0.5),
+      vx: (Math.random() - 0.5) * 8,
+      vy: Math.random() * 4,
+      r: 6 + Math.random() * 8,
+      c: "hsl(38," + Math.round(48 + Math.random() * 22) + "%," + Math.round(52 + Math.random() * 34) + "%)"
+    });
+  }
+}
+window.addEventListener("deviceorientation", function (e) {
+  if (e.gamma === null || e.beta === null) return;
+  var gx = Math.max(-60, Math.min(60, e.gamma));
+  var gy = Math.max(-60, Math.min(60, e.beta));
+  SIM.gx = gx / 60 * 0.35;
+  SIM.gy = gy / 60 * 0.35;
+  SIM.gyro = true;
+});
+function simStep() {
+  var w = simCanvas.width, h = simCanvas.height, m = 26;
+  var balls = SIM.balls, n = balls.length, i, j, a, b;
+  var ax = SIM.gyro ? SIM.gx : 0, ay = SIM.gyro ? SIM.gy : GRAV;
+  SIM.t++;
+  for (i = 0; i < n; i++) {
+    a = balls[i];
+    a.vx += ax; a.vy += ay;
+    a.x += a.vx; a.y += a.vy;
+    if (a.x < m + a.r) { a.x = m + a.r; a.vx = -a.vx * REST; }
+    if (a.x > w - m - a.r) { a.x = w - m - a.r; a.vx = -a.vx * REST; }
+    if (a.y < m + a.r) { a.y = m + a.r; a.vy = -a.vy * REST; }
+    if (a.y > h - m - a.r) { a.y = h - m - a.r; a.vy = -a.vy * REST; }
+  }
+  for (i = 0; i < n; i++) {
+    a = balls[i];
+    for (j = i + 1; j < n; j++) {
+      b = balls[j];
+      var dx = b.x - a.x, dy = b.y - a.y;
+      var min = a.r + b.r;
+      var d2 = dx * dx + dy * dy;
+      if (d2 >= min * min || d2 < 1e-9) continue;
+      var d = Math.sqrt(d2), nx = dx / d, ny = dy / d;
+      var push = (min - d) / 2;
+      a.x -= nx * push; a.y -= ny * push;
+      b.x += nx * push; b.y += ny * push;
+      var rvn = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+      if (rvn < 0) {
+        var imp = -(1 + BREST) * rvn / 2;
+        a.vx -= imp * nx; a.vy -= imp * ny;
+        b.vx += imp * nx; b.vy += imp * ny;
+      }
+    }
+  }
+}
+function simDraw() {
+  var w = simCanvas.width, h = simCanvas.height;
+  sctx.fillStyle = "#0a0f1a";
+  sctx.fillRect(0, 0, w, h);
+  var balls = SIM.balls, i, b;
+  for (i = 0; i < balls.length; i++) {
+    b = balls[i];
+    sctx.fillStyle = b.c;
+    sctx.beginPath();
+    sctx.arc(b.x, b.y, b.r, 0, 6.2832);
+    sctx.fill();
+  }
+}
+(function simLoop() {
+  requestAnimationFrame(simLoop);
+  if (!SIM.active) return;
+  simStep();
+  simDraw();
+  if (SIM.t % 120 === 0) adaptFromSource(simCanvas);
+})();
+window.addEventListener("resize", function () { simResize(); if (SIM.active) initBalls(); });
+gc.addEventListener("transitionend", function (e) {
+  if (e.propertyName === "width" || e.propertyName === "height") rebuildNow();
+});
+simResize();
+
+/* ===== export tuned glass as standalone html ===== */
+function buildExport() {
+  function num(id) { return +document.getElementById(id).value; }
+  function rgbOf(id) { return hexToRgb(document.getElementById(id).value); }
+  var T = {
+    radius: num("sRadius"), thick: num("sThick"), bezel: num("sBezel"), ior: num("sIor"),
+    scale: num("sScale"), blur: num("sFBlur"), specOp: num("sSpecOp"), specSat: num("sSpecSat"),
+    shRgb: rgbOf("sShColor"), shBlur: num("sShBlur"), shSpread: num("sShSpread"),
+    tintRgb: rgbOf("sTintColor"), tintOpF: (num("sTintOp") / 100).toFixed(3),
+    outBlur: num("sOutBlur")
+  };
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>liquid glass · tuned</title>
+<!--
+  Standalone tuned liquid glass — generated by the liquid glass demo
+  tuned params: radius=${T.radius}px thickness=${T.thick} bezel=${T.bezel} ior=${T.ior} scale=${T.scale} blur=${T.blur} specOpacity=${T.specOp} specSat=${T.specSat}
+  inner shadow: rgba(${T.shRgb},.45) ${T.shBlur}px ${T.shSpread}px · tint: rgba(${T.tintRgb},${T.tintOpF}) · outer shadow blur ${T.outBlur}px
+  refraction engine adapted from archisvaze/liquid-glass (physics-based, Snell's law)
+-->
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { font-family: -apple-system, "SF Pro Text", "PingFang SC", sans-serif; background: #101418; }
+  .float { position: fixed; left: 50%; top: 50%; z-index: 10; }
+  #gc {
+    position: relative;
+    width: var(--gsize, 280px); height: var(--gsize, 280px);
+    transform: translate(-50%, -50%);
+    border-radius: ${T.radius}px;
+    isolation: isolate;
+    box-shadow: 0 4px ${T.outBlur}px rgba(0,0,0,.18);
+  }
+  #gc::after {
+    content: ''; position: absolute; inset: 0; z-index: -1; border-radius: inherit;
+    backdrop-filter: url(#liquid-glass-filter);
+    -webkit-backdrop-filter: url(#liquid-glass-filter);
+    isolation: isolate;
+  }
+  body.no-refraction #gc::after {
+    backdrop-filter: blur(10px) saturate(1.05);
+    -webkit-backdrop-filter: blur(10px) saturate(1.05);
+  }
+  #gc::before {
+    content: ''; position: absolute; inset: 0; z-index: 1; border-radius: inherit;
+    box-shadow: inset 0 0 ${T.shBlur}px ${T.shSpread}px rgba(${T.shRgb},0.45);
+    background: rgba(${T.tintRgb}, ${T.tintOpF});
+    pointer-events: none;
+  }
+  .glass-label {
+    position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
+    text-align: center; pointer-events: none;
+    color: rgba(255,255,255,.94); font-size: 15px; font-weight: 500;
+    letter-spacing: .12em; text-shadow: 0 1px 8px rgba(0,0,0,.45);
+  }
+</style>
+</head>
+<body>
+  <!-- put your own background / content behind the glass -->
+  <div class="float">
+    <div id="gc"><span class="glass-label">Liquid Glass</span></div>
+  </div>
+  <svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="position:absolute;overflow:hidden" color-interpolation-filters="sRGB">
+    <defs id="svgDefs"></defs>
+  </svg>
+<script>
+if (!window.chrome) document.body.classList.add('no-refraction');
+var P = {
+  radius: ${T.radius}, glassThick: ${T.thick}, bezelW: ${T.bezel}, ior: ${T.ior},
+  scaleRatio: ${T.scale}, blurAmt: ${T.blur}, specOpacity: ${T.specOp}, specSat: ${T.specSat}
+};
+function calculateRefractionProfile(glassThickness, bezelWidth, ior, samples) {
+  samples = samples || 128;
+  var eta = 1 / ior;
+  var heightFn = function (x) { return Math.pow(1 - Math.pow(1 - x, 4), 0.25); };
+  function refract(nx, ny) {
+    var dot = ny;
+    var k = 1 - eta * eta * (1 - dot * dot);
+    if (k < 0) return null;
+    var sq = Math.sqrt(k);
+    return [-(eta * dot + sq) * nx, eta - (eta * dot + sq) * ny];
+  }
+  var profile = new Float64Array(samples);
+  for (var i = 0; i < samples; i++) {
+    var x = i / samples;
+    var y = heightFn(x);
+    var dx = x < 1 ? 0.0001 : -0.0001;
+    var y2 = heightFn(x + dx);
+    var deriv = (y2 - y) / dx;
+    var mag = Math.sqrt(deriv * deriv + 1);
+    var ref = refract(-deriv / mag, -1 / mag);
+    if (!ref) { profile[i] = 0; continue; }
+    profile[i] = ref[0] * ((y * bezelWidth + glassThickness) / ref[1]);
+  }
+  return profile;
+}
+function generateDisplacementMap(w, h, radius, bezelWidth, profile, maxDisp) {
+  var c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  var ctx = c.getContext("2d");
+  var img = ctx.createImageData(w, h);
+  var d = img.data;
+  for (var i = 0; i < d.length; i += 4) { d[i] = 128; d[i+1] = 128; d[i+2] = 0; d[i+3] = 255; }
+  var r = radius, rSq = r * r, r1Sq = (r + 1) * (r + 1);
+  var rBSq = Math.max(r - bezelWidth, 0) * Math.max(r - bezelWidth, 0);
+  var wB = w - r * 2, hB = h - r * 2, S = profile.length;
+  for (var y1 = 0; y1 < h; y1++) {
+    for (var x1 = 0; x1 < w; x1++) {
+      var x = x1 < r ? x1 - r : x1 >= w - r ? x1 - r - wB : 0;
+      var y = y1 < r ? y1 - r : y1 >= h - r ? y1 - r - hB : 0;
+      var dSq = x * x + y * y;
+      if (dSq > r1Sq || dSq < rBSq) continue;
+      var dist = Math.sqrt(dSq);
+      var fromSide = r - dist;
+      var op = dSq < rSq ? 1 : 1 - (dist - Math.sqrt(rSq)) / (Math.sqrt(r1Sq) - Math.sqrt(rSq));
+      if (op <= 0 || dist === 0) continue;
+      var cos = x / dist, sin = y / dist;
+      var bi = Math.min(((fromSide / bezelWidth) * S) | 0, S - 1);
+      var disp = profile[bi] || 0;
+      var dX = (-cos * disp) / maxDisp, dY = (-sin * disp) / maxDisp;
+      var idx = (y1 * w + x1) * 4;
+      d[idx] = (128 + dX * 127 * op + 0.5) | 0;
+      d[idx + 1] = (128 + dY * 127 * op + 0.5) | 0;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return c.toDataURL();
+}
+function generateSpecularMap(w, h, radius, bezelWidth, angle) {
+  angle = (angle != null) ? angle : Math.PI / 3;
+  var c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  var ctx = c.getContext("2d");
+  var img = ctx.createImageData(w, h);
+  var d = img.data;
+  d.fill(0);
+  var r = radius, rSq = r * r, r1Sq = (r + 1) * (r + 1);
+  var rBSq = Math.max(r - bezelWidth, 0) * Math.max(r - bezelWidth, 0);
+  var wB = w - r * 2, hB = h - r * 2;
+  var sv = [Math.cos(angle), Math.sin(angle)];
+  for (var y1 = 0; y1 < h; y1++) {
+    for (var x1 = 0; x1 < w; x1++) {
+      var x = x1 < r ? x1 - r : x1 >= w - r ? x1 - r - wB : 0;
+      var y = y1 < r ? y1 - r : y1 >= h - r ? y1 - r - hB : 0;
+      var dSq = x * x + y * y;
+      if (dSq > r1Sq || dSq < rBSq) continue;
+      var dist = Math.sqrt(dSq);
+      var fromSide = r - dist;
+      var op = dSq < rSq ? 1 : 1 - (dist - Math.sqrt(rSq)) / (Math.sqrt(r1Sq) - Math.sqrt(rSq));
+      if (op <= 0 || dist === 0) continue;
+      var cos = x / dist, sin = -y / dist;
+      var dot = Math.abs(cos * sv[0] + sin * sv[1]);
+      var edge = Math.sqrt(Math.max(0, 1 - (1 - fromSide) * (1 - fromSide)));
+      var coeff = dot * edge;
+      var col = (255 * coeff) | 0;
+      var alpha = (col * coeff * op) | 0;
+      var idx = (y1 * w + x1) * 4;
+      d[idx] = col; d[idx + 1] = col; d[idx + 2] = col; d[idx + 3] = alpha;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return c.toDataURL();
+}
+function rebuild() {
+  if (document.body.classList.contains("no-refraction")) return;
+  var gc = document.getElementById("gc");
+  var w = gc.offsetWidth, h = gc.offsetHeight;
+  if (w < 2 || h < 2) return;
+  var clampedBezel = Math.min(P.bezelW, P.radius - 1, Math.min(w, h) / 2 - 1);
+  var profile = calculateRefractionProfile(P.glassThick, clampedBezel, P.ior, 128);
+  var maxDisp = 1, i;
+  for (i = 0; i < profile.length; i++) if (Math.abs(profile[i]) > maxDisp) maxDisp = Math.abs(profile[i]);
+  var dispUrl = generateDisplacementMap(w, h, P.radius, clampedBezel, profile, maxDisp);
+  var specUrl = generateSpecularMap(w, h, P.radius, clampedBezel * 2.5);
+  var scale = maxDisp * P.scaleRatio;
+  document.getElementById("svgDefs").innerHTML =
+    '<filter id="liquid-glass-filter" x="0%" y="0%" width="100%" height="100%">' +
+    '<feGaussianBlur in="SourceGraphic" stdDeviation="' + P.blurAmt + '" result="blurred_source" />' +
+    '<feImage href="' + dispUrl + '" x="0" y="0" width="' + w + '" height="' + h + '" result="disp_map" />' +
+    '<feDisplacementMap in="blurred_source" in2="disp_map" scale="' + scale + '" xChannelSelector="R" yChannelSelector="G" result="displaced" />' +
+    '<feColorMatrix in="displaced" type="saturate" values="' + P.specSat + '" result="displaced_sat" />' +
+    '<feImage href="' + specUrl + '" x="0" y="0" width="' + w + '" height="' + h + '" result="spec_layer" />' +
+    '<feComposite in="displaced_sat" in2="spec_layer" operator="in" result="spec_masked" />' +
+    '<feComponentTransfer in="spec_layer" result="spec_faded"><feFuncA type="linear" slope="' + P.specOpacity + '" /></feComponentTransfer>' +
+    '<feBlend in="spec_masked" in2="displaced" mode="normal" result="with_sat" />' +
+    '<feBlend in="spec_faded" in2="with_sat" mode="normal" />' +
+    '</filter>' + thumbFilter;
+}
+window.addEventListener("load", function () {
+  requestAnimationFrame(function () { requestAnimationFrame(rebuild); });
+});
+var rz;
+window.addEventListener("resize", function () {
+  clearTimeout(rz);
+  rz = setTimeout(rebuild, 150);
+});
+<\/script>
+</body>
+</html>`;
+}
+document.getElementById("dlBtn").addEventListener("click", function () {
+  document.getElementById("dlPop").classList.toggle("show");
+  var blob = new Blob([buildExport()], { type: "text/html" });
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "liquid glass developer tuned code by Michael To.html";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+});
+</script>
+</body>
+</html>

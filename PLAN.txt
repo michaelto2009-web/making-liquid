@@ -1,0 +1,30 @@
+LIQUID GLASS DEMO - DEPLOYMENT PLAN
+===================================
+
+WHAT YOU HAVE
+  index.html          the demo (references images/bg-1..7.jpg)
+  fetch-images.py     downloads the 7 photos (run once, needs internet)
+  images/             (empty until you run the fetcher)
+
+STEP 0 - GET THE IMAGES (one time, needs internet)
+  cd into this folder, then:
+      python3 fetch-images.py
+  (Windows: same command works if Python is installed; or ask me for a .bat)
+
+OPTION A - GITHUB PAGES (free, permanent)
+  1. github.com -> sign up (free)
+  2. "+" -> New repository -> name: liquid-glass -> Public -> Create
+  3. Add file -> Upload files -> drag index.html AND the images folder in
+  4. Settings -> Pages -> Source: Deploy from a branch -> main /(root) -> Save
+  5. wait 1 min -> https://YOURUSERNAME.github.io/liquid-glass/
+
+OPTION B - NETLIFY DROP (fastest)
+  1. drag this whole folder onto app.netlify.com/drop
+  2. instant URL, free account to keep it forever
+
+OPTION C - JUST KEEP IT LOCAL
+  double-click index.html after step 0 - works fully offline.
+
+NOTES
+  - The 8th "bouncing balls" scene is generated in code, no image needed.
+  - Licenses: Unsplash & Pexels photos are free to use and hotlink.
