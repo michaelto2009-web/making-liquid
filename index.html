@@ -73,7 +73,11 @@
     -webkit-backdrop-filter: url(#liquid-glass-filter);
     isolation: isolate;
   }
-  body.no-refraction #gc::after { backdrop-filter: blur(10px) saturate(1.05); -webkit-backdrop-filter: blur(10px) saturate(1.05); }
+  body.no-refraction #gc::after {
+    backdrop-filter: blur(12px) saturate(1.1);
+    -webkit-backdrop-filter: blur(12px) saturate(1.1);
+    background: rgba(140,145,155,.14);
+  }
   #gc::before {
     content: ''; position: absolute; inset: 0; z-index: 1; border-radius: inherit;
     box-shadow: inset 0 0 var(--shadow-blur) var(--shadow-spread) var(--shadow-color);
@@ -366,7 +370,7 @@
   <div class="why" id="whyBox">
     <div class="why-toggle" id="whyToggle">why I built this <span class="caret">&#9662;</span></div>
     <div class="why-body">
-      <span>I built this to help people develop custom, personalized liquid glass UI, because AI can't do it yet. it hasn't been trained on liquid glass, so everything so far has been reverse engineered by hand. this is a fun experiment, and a place to explore more forms of glass UI with the actual code behind it.</span>
+      <span>I built this to help people develop custom, personalized liquid glass UI, because AI can't do it yet. it hasn't been trained on liquid glass, so everything so far is reverse engineered, and it's good enough. this is a fun experiment, and a place to explore more forms of glass UI with the actual code behind it.</span>
     </div>
   </div>
 
@@ -471,7 +475,11 @@
 
 <script>
 /* ===== chromium check: the SVG-filter backdrop trick needs Chromium ===== */
-if (!window.chrome) document.body.classList.add('no-refraction');
+var UA = navigator.userAgent;
+var IS_IOS = /iP(hone|ad|od)/.test(UA) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+/* all iOS browsers are WebKit under the hood: no SVG-filter backdrop-filter */
+var REFRACTION_OK = !!window.chrome && !IS_IOS;
+if (!REFRACTION_OK) document.body.classList.add("no-refraction");
 
 /* ===== nature backgrounds (4K) with crossfade ===== */
 var BGS = [
@@ -1252,7 +1260,11 @@ function buildExport() {
     <defs id="svgDefs"></defs>
   </svg>
 <script>
-if (!window.chrome) document.body.classList.add('no-refraction');
+var UA = navigator.userAgent;
+var IS_IOS = /iP(hone|ad|od)/.test(UA) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+/* all iOS browsers are WebKit under the hood: no SVG-filter backdrop-filter */
+var REFRACTION_OK = !!window.chrome && !IS_IOS;
+if (!REFRACTION_OK) document.body.classList.add("no-refraction");
 var P = {
   radius: ${T.radius}, glassThick: ${T.thick}, bezelW: ${T.bezel}, ior: ${T.ior},
   scaleRatio: ${T.scale}, blurAmt: ${T.blur}, specOpacity: ${T.specOp}, specSat: ${T.specSat}
